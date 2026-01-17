@@ -148,6 +148,21 @@ If nil, will try to auto-detect from environment variables."
   :type 'integer
   :group 'lexforge)
 
+(defcustom lexforge-use-lexdb nil
+  "Whether to use lexdb as dictionary source.
+When non-nil, lexforge will first query lexdb for word data,
+then use AI to select appropriate senses based on context.
+When nil, AI will generate definitions directly."
+  :type 'boolean
+  :group 'lexforge)
+
+(defcustom lexforge-lexdb-adapter nil
+  "The lexdb adapter ID to use for lookups.
+If nil, uses the current adapter in lexdb."
+  :type '(choice (const :tag "Use current adapter" nil)
+                 (string :tag "Adapter ID"))
+  :group 'lexforge)
+
 ;;;; Prompt Templates
 
 (defcustom lexforge-prompt-word-analysis
@@ -180,6 +195,29 @@ Requirements: Use all words naturally with complete structure.
 Return JSON:
 {\"title\": \"title\", \"content\": \"content\", \"translation\": \"Chinese translation\", \"word_usage\": [{\"word\": \"word\", \"sentence\": \"sentence\", \"explanation\": \"explanation\"}]}"
   "Prompt for essay generation."
+  :type 'string
+  :group 'lexforge-ai)
+
+(defcustom lexforge-prompt-select-senses
+  "The word \"%s\" has multiple dictionary senses and examples.
+
+Context (if available): %s
+
+Dictionary data:
+%s
+
+Based on the context (or common usage if no context), select the most appropriate sense(s) and example(s).
+
+Return JSON:
+{\"lemma\":\"%s\",\"phonetic\":\"%s\",\"definitions\":[{\"pos\":\"v.\",\"meaning\":\"Chinese meaning\",\"meaning_en\":\"English meaning\"}],\"examples\":[{\"en\":\"example sentence\",\"zh\":\"Chinese translation\"}]}
+
+Requirements:
+- Select 1-2 most relevant definitions based on context
+- Select 1 most relevant example
+- Translate meanings and examples to Chinese
+- Keep original English meanings from dictionary
+- JSON only, no explanation"
+  "Prompt for selecting senses from lexdb data."
   :type 'string
   :group 'lexforge-ai)
 
@@ -521,6 +559,80 @@ CREATE TABLE IF NOT EXISTS review_logs (
       (caar (sqlite-select db "SELECT COUNT(*) FROM words WHERE group_name IS NULL")))))
 
 ;;;; ============================================================
+;;;; Lexdb Integration Module
+;;;; ============================================================
+;; Integration with lexdb for dictionary lookups.
+;; When lexforge-use-lexdb is non-nil, we query lexdb first,
+;; then use AI to select appropriate senses based on context.
+
+(declare-function lexdb-lookup "lexdb")
+(declare-function lexdb-entry-headword "lexdb")
+(declare-function lexdb-entry-senses "lexdb")
+(declare-function lexdb-entry-pronunciations "lexdb")
+(declare-function lexdb-sense-definition "lexdb")
+(declare-function lexdb-sense-examples "lexdb")
+(declare-function lexdb-sense-labels "lexdb")
+(declare-function lexdb-example-text "lexdb")
+(declare-function lexdb-pronunciation-ipa "lexdb")
+
+(defun lexforge-lexdb--available-p ()
+  "Check if lexdb is available."
+  (and lexforge-use-lexdb
+       (featurep 'lexdb)))
+
+(defun lexforge-lexdb-lookup (word)
+  "Lookup WORD in lexdb, return entries or nil."
+  (when (lexforge-lexdb--available-p)
+    (condition-case nil
+        (lexdb-lookup word lexforge-lexdb-adapter)
+      (error nil))))
+
+(defun lexforge-lexdb--format-entry-for-ai (entries)
+  "Format lexdb ENTRIES as text for AI prompt."
+  (when entries
+    (with-temp-buffer
+      (let ((entry-num 0))
+        (dolist (entry entries)
+          (cl-incf entry-num)
+          (insert (format "\n=== Entry %d: %s ===\n"
+                          entry-num
+                          (or (lexdb-entry-headword entry) "?")))
+          ;; Pronunciations
+          (when-let ((prons (lexdb-entry-pronunciations entry)))
+            (dolist (pron prons)
+              (when-let ((ipa (lexdb-pronunciation-ipa pron)))
+                (insert (format "Pronunciation: %s\n" ipa)))))
+          ;; Senses
+          (let ((sense-num 0))
+            (dolist (sense (lexdb-entry-senses entry))
+              (cl-incf sense-num)
+              (insert (format "\nSense %d:\n" sense-num))
+              ;; Labels (POS, etc.)
+              (when-let ((labels (lexdb-sense-labels sense)))
+                (insert (format "  Labels: %s\n"
+                                (mapconcat #'identity labels ", "))))
+              ;; Definition
+              (when-let ((def (lexdb-sense-definition sense)))
+                (insert (format "  Definition: %s\n" def)))
+              ;; Examples
+              (when-let ((examples (lexdb-sense-examples sense)))
+                (insert "  Examples:\n")
+                (dolist (ex examples)
+                  (when-let ((text (lexdb-example-text ex)))
+                    (insert (format "    - %s\n" text)))))))))
+      (buffer-string))))
+
+(defun lexforge-lexdb--get-first-phonetic (entries)
+  "Get first available IPA from ENTRIES."
+  (catch 'found
+    (dolist (entry entries)
+      (when-let ((prons (lexdb-entry-pronunciations entry)))
+        (dolist (pron prons)
+          (when-let ((ipa (lexdb-pronunciation-ipa pron)))
+            (throw 'found ipa)))))
+    nil))
+
+;;;; ============================================================
 ;;;; AI Module
 ;;;; ============================================================
 
@@ -652,8 +764,21 @@ See https://openrouter.ai/models for available models."
   "Return non-nil if TEXT is a phrase (contains spaces)."
   (and text (string-match-p " " text)))
 
-(defun lexforge-ai-analyze-word (word callback &optional error-callback)
-  "Analyze WORD (or phrase)."
+(defun lexforge-ai-analyze-word (word callback &optional error-callback context)
+  "Analyze WORD (or phrase).
+If `lexforge-use-lexdb' is non-nil and lexdb has data for WORD,
+use AI to select appropriate senses from lexdb data.
+Otherwise, generate definitions using AI directly.
+CONTEXT is optional context for better sense selection."
+  (let ((lexdb-entries (lexforge-lexdb-lookup word)))
+    (if lexdb-entries
+        ;; Use lexdb data + AI selection
+        (lexforge-ai--select-senses word lexdb-entries context callback error-callback)
+      ;; Fallback to AI generation
+      (lexforge-ai--generate-analysis word callback error-callback))))
+
+(defun lexforge-ai--generate-analysis (word callback &optional error-callback)
+  "Generate analysis for WORD using AI directly (original behavior)."
   (let ((prompt (if (lexforge--is-phrase-p word)
                     (format lexforge-prompt-phrase-analysis word word)
                   (format lexforge-prompt-word-analysis word))))
@@ -681,6 +806,35 @@ See https://openrouter.ai/models for available models."
                    (funcall error-callback (format "Parse error: %s" err))))))))
          (when parsed
            ;; Convert vectors to lists (JSON arrays parse as vectors)
+           (setq parsed (lexforge-ai--vectors-to-lists parsed))
+           (funcall callback parsed))))
+     error-callback)))
+
+(defun lexforge-ai--select-senses (word entries context callback &optional error-callback)
+  "Use AI to select appropriate senses from lexdb ENTRIES for WORD.
+CONTEXT provides the usage context for better selection."
+  (let* ((dict-data (lexforge-lexdb--format-entry-for-ai entries))
+         (phonetic (or (lexforge-lexdb--get-first-phonetic entries) ""))
+         (context-str (or context "(no context provided)"))
+         (prompt (format lexforge-prompt-select-senses
+                         word context-str dict-data word phonetic)))
+    (message "Using lexdb data for '%s'" word)
+    (lexforge-ai-request
+     prompt
+     (lambda (response)
+       (let* ((cleaned (lexforge-ai--clean-json response))
+              (parsed nil))
+         (condition-case nil
+             (setq parsed (json-read-from-string cleaned))
+           (error
+            (let ((fixed (lexforge-ai--try-fix-json cleaned)))
+              (condition-case err
+                  (setq parsed (json-read-from-string fixed))
+                (error
+                 (message "Parse error with lexdb selection: %s" err)
+                 (when error-callback
+                   (funcall error-callback (format "Parse error: %s" err))))))))
+         (when parsed
            (setq parsed (lexforge-ai--vectors-to-lists parsed))
            (funcall callback parsed))))
      error-callback)))
@@ -1152,6 +1306,28 @@ Preserves PROPERTIES and context quote (BEGIN_QUOTE...END_QUOTE)."
               (org-element-property :VOCAB_ID (org-element-at-point))))))
     (when-let ((found (lexforge-org-find-word word)))
       (lexforge-org-get-lexforge-id word (car found)))))
+
+(defun lexforge-org-get-context (word &optional group)
+  "Get context (BEGIN_QUOTE content) for WORD. If GROUP is nil, search all files."
+  (if group
+      (let ((file (lexforge-org--group-file group)))
+        (when (file-exists-p file)
+          (with-temp-buffer
+            (insert-file-contents file)
+            (goto-char (point-min))
+            (when (re-search-forward (format "^\\* %s$" (regexp-quote word)) nil t)
+              (let ((entry-end (save-excursion
+                                 (if (re-search-forward "^\\* " nil t)
+                                     (line-beginning-position)
+                                   (point-max)))))
+                (when (re-search-forward "#\\+BEGIN_QUOTE" entry-end t)
+                  (forward-line 1)
+                  (let ((start (point)))
+                    (when (re-search-forward "#\\+END_QUOTE" entry-end t)
+                      (string-trim (buffer-substring-no-properties
+                                    start (line-beginning-position)))))))))))
+    (when-let ((found (lexforge-org-find-word word)))
+      (lexforge-org-get-context word (car found)))))
 
 ;;;###autoload
 (defun lexforge-build ()
@@ -1973,24 +2149,32 @@ Otherwise, capture the word at point."
    (t (thing-at-point 'sentence t))))
 
 (defun lexforge--fetch-word-data (word group)
-  "Fetch AI data for WORD in GROUP, update Org file only (async)."
-  (lexforge-ai-analyze-word
-   word
-   (lambda (data)
-     (lexforge--process-word-data word group data))
-   (lambda (err) (message "✗ %s: %s" word err))))
+  "Fetch AI data for WORD in GROUP, update Org file only (async).
+If lexdb is enabled, uses stored context for better sense selection."
+  (let ((context (when lexforge-use-lexdb
+                   (lexforge-org-get-context word group))))
+    (lexforge-ai-analyze-word
+     word
+     (lambda (data)
+       (lexforge--process-word-data word group data))
+     (lambda (err) (message "✗ %s: %s" word err))
+     context)))
 
 (defun lexforge--fetch-word-data-sync (word group)
-  "Fetch AI data for WORD in GROUP synchronously."
+  "Fetch AI data for WORD in GROUP synchronously.
+If lexdb is enabled, uses stored context for better sense selection."
   (let ((result nil)
         (done nil)
-        (err-msg nil))
+        (err-msg nil)
+        (context (when lexforge-use-lexdb
+                   (lexforge-org-get-context word group))))
     (lexforge-ai-analyze-word
      word
      (lambda (data)
        (setq result data done t))
      (lambda (err)
-       (setq err-msg err done t)))
+       (setq err-msg err done t))
+     context)
     ;; Wait for completion (max 30 seconds)
     (let ((timeout 30)
           (elapsed 0))
