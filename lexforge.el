@@ -148,17 +148,10 @@ If nil, will try to auto-detect from environment variables."
   :type 'integer
   :group 'lexforge)
 
-(defcustom lexforge-use-lexdb nil
-  "Whether to use lexdb as dictionary source.
-When non-nil, lexforge will first query lexdb for word data,
-then use AI to select appropriate senses based on context.
-When nil, AI will generate definitions directly."
-  :type 'boolean
-  :group 'lexforge)
-
 (defcustom lexforge-lexdb-adapter nil
   "The lexdb adapter ID to use for lookups.
-If nil, uses the current adapter in lexdb."
+If nil, uses the current adapter in lexdb.
+Lexdb integration is automatically enabled when lexdb is loaded."
   :type '(choice (const :tag "Use current adapter" nil)
                  (string :tag "Adapter ID"))
   :group 'lexforge)
@@ -214,9 +207,20 @@ Return JSON:
 Requirements:
 - Select 1-2 most relevant definitions based on context
 - Select 1 most relevant example
-- Translate meanings and examples to Chinese
+- If Chinese translation already exists in dictionary data, use it directly
+- If no Chinese translation exists, translate following the '中文重生场' style below
 - Keep original English meanings from dictionary
-- JSON only, no explanation"
+- JSON only, no explanation
+
+=== 中文重生场 Translation Style ===
+英文进入此场即死，中文从其养分中生。
+
+【遗忘之律】忘记英文的句法和语序，只记住它要说的事。
+【重生之律】如果你是中国作者，面对中国读者，你会怎么讲？
+【地道之律】用中文自己的韵律：四字短语的节奏感、口语的亲切感、成语俗语的画面感。
+
+检验标准：读完后，读者会说「写得真好」而不是「翻译得真好」。
+真实之锚：术语规范标注，如：大语言模型（LLM）"
   "Prompt for selecting senses from lexdb data."
   :type 'string
   :group 'lexforge-ai)
@@ -576,9 +580,9 @@ CREATE TABLE IF NOT EXISTS review_logs (
 (declare-function lexdb-pronunciation-ipa "lexdb")
 
 (defun lexforge-lexdb--available-p ()
-  "Check if lexdb is available."
-  (and lexforge-use-lexdb
-       (featurep 'lexdb)))
+  "Check if lexdb is available.
+Returns non-nil when lexdb package is loaded."
+  (featurep 'lexdb))
 
 (defun lexforge-lexdb-lookup (word)
   "Lookup WORD in lexdb, return entries or nil."
@@ -2150,8 +2154,8 @@ Otherwise, capture the word at point."
 
 (defun lexforge--fetch-word-data (word group)
   "Fetch AI data for WORD in GROUP, update Org file only (async).
-If lexdb is enabled, uses stored context for better sense selection."
-  (let ((context (when lexforge-use-lexdb
+If lexdb is loaded, uses stored context for better sense selection."
+  (let ((context (when (lexforge-lexdb--available-p)
                    (lexforge-org-get-context word group))))
     (lexforge-ai-analyze-word
      word
@@ -2162,11 +2166,11 @@ If lexdb is enabled, uses stored context for better sense selection."
 
 (defun lexforge--fetch-word-data-sync (word group)
   "Fetch AI data for WORD in GROUP synchronously.
-If lexdb is enabled, uses stored context for better sense selection."
+If lexdb is loaded, uses stored context for better sense selection."
   (let ((result nil)
         (done nil)
         (err-msg nil)
-        (context (when lexforge-use-lexdb
+        (context (when (lexforge-lexdb--available-p)
                    (lexforge-org-get-context word group))))
     (lexforge-ai-analyze-word
      word
